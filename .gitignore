@@ -1,0 +1,5 @@
+# 添加发布配置以优化二进制大小
+target/
+
+# Cargo锁文件
+Cargo.lock

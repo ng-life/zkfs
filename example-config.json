@@ -1,0 +1,13 @@
+{
+    "database": {
+        "host": "localhost",
+        "port": 3306,
+        "username": "admin",
+        "database": "myapp"
+    },
+    "redis": {
+        "host": "localhost",
+        "port": 6379
+    },
+    "version": "1.0.0"
+}
