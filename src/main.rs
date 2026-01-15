@@ -106,10 +106,19 @@ async fn main() -> Result<()> {
         Commands::Stat { path } => {
             stat_command(&client, &path).await?;
         }
-        Commands::Rm { path, recursive, force } => {
+        Commands::Rm {
+            path,
+            recursive,
+            force,
+        } => {
             rm_command(&client, &path, recursive, force).await?;
         }
-        Commands::Create { path, data, file, node_type } => {
+        Commands::Create {
+            path,
+            data,
+            file,
+            node_type,
+        } => {
             create_command(&client, &path, data.as_deref(), file.as_deref(), &node_type).await?;
         }
         Commands::Set { path, data, file } => {
@@ -121,10 +130,7 @@ async fn main() -> Result<()> {
 }
 
 /// ls命令：列出子节点
-async fn ls_command(
-    session: &zookeeper_client::Client,
-    path: &str,
-) -> Result<()> {
+async fn ls_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let children = session
         .list_children(path)
         .await
@@ -138,10 +144,7 @@ async fn ls_command(
 }
 
 /// dir命令：列出子节点及详细信息
-async fn dir_command(
-    session: &zookeeper_client::Client,
-    path: &str,
-) -> Result<()> {
+async fn dir_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let children = session
         .list_children(path)
         .await
@@ -173,10 +176,7 @@ async fn dir_command(
             Ok(Some(child_stat)) => {
                 println!(
                     "  {} (版本: {}, 子节点: {}, 数据大小: {} bytes)",
-                    child,
-                    child_stat.version,
-                    child_stat.num_children,
-                    child_stat.data_length
+                    child, child_stat.version, child_stat.num_children, child_stat.data_length
                 );
             }
             Ok(None) => {
@@ -192,10 +192,7 @@ async fn dir_command(
 }
 
 /// cat命令：显示节点数据
-async fn cat_command(
-    session: &zookeeper_client::Client,
-    path: &str,
-) -> Result<()> {
+async fn cat_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let (data, _stat) = session
         .get_data(path)
         .await
@@ -222,10 +219,7 @@ async fn cat_command(
 }
 
 /// stat命令：显示节点状态
-async fn stat_command(
-    session: &zookeeper_client::Client,
-    path: &str,
-) -> Result<()> {
+async fn stat_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let stat = session
         .check_stat(path)
         .await
@@ -269,7 +263,7 @@ async fn create_command(
     };
 
     println!("成功创建节点: {}", actual_path);
-    if data_bytes.len() > 0 {
+    if !data_bytes.is_empty() {
         println!("写入数据: {} bytes", data_bytes.len());
     }
 
@@ -311,9 +305,7 @@ async fn get_data_from_input(data: Option<&str>, file: Option<&str>) -> Result<V
                 .await
                 .context(format!("无法读取文件: {}", f))
         }
-        (Some(_), Some(_)) => {
-            Err(anyhow::anyhow!("不能同时指定 --data 和 --file 参数"))
-        }
+        (Some(_), Some(_)) => Err(anyhow::anyhow!("不能同时指定 --data 和 --file 参数")),
         (None, None) => {
             // 都不指定则返回空数据
             Ok(Vec::new())
@@ -366,8 +358,7 @@ async fn rm_command(
                 println!("警告: 删除 {} 时出错: {}", path, e);
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::from(e)
-                .context(format!("无法删除节点: {}", path))),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点: {}", path))),
         }
     }
 }
@@ -387,8 +378,7 @@ fn delete_recursive<'a>(
                 return Ok(());
             }
             Err(e) => {
-                return Err(anyhow::Error::from(e)
-                    .context(format!("无法列出路径: {}", path)));
+                return Err(anyhow::Error::from(e).context(format!("无法列出路径: {}", path)));
             }
         };
 
@@ -416,8 +406,7 @@ fn delete_recursive<'a>(
                 println!("警告: 删除 {} 时出错: {}", path, e);
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::from(e)
-                .context(format!("无法删除节点: {}", path))),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点: {}", path))),
         }
     })
 }
