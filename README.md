@@ -1,5 +1,9 @@
 # zkfs - Zookeeper 文件系统命令行工具
 
+[![CI](https://github.com/ng-life/zkfs/workflows/CI/badge.svg)](https://github.com/ng-life/zkfs/actions)
+[![Security Audit](https://github.com/ng-life/zkfs/workflows/Security%20Audit/badge.svg)](https://github.com/ng-life/zkfs/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 一个用Rust编写的Zookeeper命令行工具，提供类似Linux文件系统命令的操作体验。
 
 ## 功能特性
@@ -433,6 +437,10 @@ cargo fmt
 cargo clippy
 ```
 
+### CI/CD
+
+本项目使用GitHub Actions进行持续集成和持续部署。详见 [.github/ACTIONS.md](.github/ACTIONS.md)。
+
 ## 常见问题
 
 ### Q: 连接失败怎么办？
@@ -461,6 +469,8 @@ MIT License
 ## 贡献
 
 欢迎提交Issue和Pull Request！
+
+详细的贡献指南请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 更新日志
 
