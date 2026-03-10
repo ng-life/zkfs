@@ -9,11 +9,12 @@
 ## 功能特性
 
 - ✅ 支持通过命令行参数或环境变量配置 Zookeeper 连接
-- ✅ 实现类似 Linux 的命令：`ls`、`dir`、`cat`、`stat`、`rm`、`create`/`add`、`set`
+- ✅ 实现类似 Linux 的命令：`ls`、`dir`、`cat`、`stat`、`rm`、`create`/`add`、`set`、`cd`、`pwd`
 - ✅ 支持递归删除（`rm -r`）和强制删除（`rm -f`）
 - ✅ 支持多种节点类型（持久、临时、顺序节点）
 - ✅ 支持从文件读取或命令行参数写入数据
 - ✅ **交互模式**（类似 telnet，保持长连接）
+- ✅ **当前路径管理**（支持相对路径、`cd` 切换目录）
 - ✅ 异步高性能操作
 - ✅ 友好的中文输出
 
@@ -97,13 +98,16 @@ $ zkfs -i -s localhost:2181
 交互式 Zookeeper 文件系统 (类似 telnet)
 输入命令执行操作，输入'quit'或'exit'退出，输入'help'查看帮助
 
-zkfs> ls /
+zkfs:/> ls /
 config
 brokers
 controller
 admin
 
-zkfs> dir /kafka
+zkfs:/> cd /kafka
+✓ 已切换到：/kafka
+
+zkfs:/kafka> dir
 路径：/kafka
 子节点数量：5
 数据版本：1
@@ -115,18 +119,21 @@ zkfs> dir /kafka
   config (版本：0, 子节点：2, 数据大小：0 bytes)
   controller (版本：1, 子节点：0, 数据大小：256 bytes)
 
-zkfs> cat /kafka/controller
+zkfs:/kafka> cat controller
 {"version":1,"brokerid":1,"timestamp":"1705334400000"}
 
-zkfs> create /config/app -d "mysql://localhost:3306"
+zkfs:/kafka> cd /config
+✓ 已切换到：/config
+
+zkfs:/config> create app -d "mysql://localhost:3306"
 ✓ 成功创建节点：/config/app
   写入数据：25 bytes
 
-zkfs> set /config/app -d "mysql://prod-db:3306"
+zkfs:/config> set app -d "mysql://prod-db:3306"
 ✓ 成功设置节点数据：/config/app
   写入数据：24 bytes
 
-zkfs> stat /config/app
+zkfs:/config> stat app
 节点路径：/config/app
 创建事务 ID: 100
 修改事务 ID: 150
@@ -140,10 +147,16 @@ ACL 版本：0
 子节点数量：0
 子节点修改事务 ID: 100
 
-zkfs> rm /config/app
-✓ 成功删除：/config/app
+zkfs:/config> rm app
+✓ 成功删除：app
 
-zkfs> quit
+zkfs:/config> pwd
+/config
+
+zkfs:/config> cd ..
+✓ 已切换到：/
+
+zkfs:/> quit
 再见！👋
 ```
 
@@ -151,13 +164,15 @@ zkfs> quit
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `ls [路径]` | 列出子节点 | `ls /`, `ls /kafka/brokers` |
-| `dir [路径]` | 列出子节点及详细信息 | `dir /`, `dir /kafka` |
-| `cat <路径>` | 显示节点数据 | `cat /config/database` |
-| `stat <路径>` | 显示节点状态 | `stat /kafka/controller` |
-| `rm [-r] [-f] <路径>` | 删除节点 | `rm /temp`, `rm -rf /test` |
-| `create <路径> [选项]` | 创建节点 | `create /app -d "data"` |
-| `set <路径> [选项>` | 设置节点数据 | `set /app -d "new data"` |
+| `ls [路径]` | 列出子节点 (默认：当前路径) | `ls`, `ls /`, `ls brokers` |
+| `dir [路径]` | 列出子节点及详细信息 (默认：当前路径) | `dir`, `dir /kafka` |
+| `cat <路径>` | 显示节点数据 | `cat config`, `cat /kafka/controller` |
+| `stat <路径>` | 显示节点状态 | `stat .`, `stat /kafka/controller` |
+| `rm [-r] [-f] <路径>` | 删除节点 | `rm temp`, `rm -rf /test` |
+| `create <路径> [选项]` | 创建节点 | `create app -d "data"` |
+| `set <路径> [选项>` | 设置节点数据 | `set app -d "new data"` |
+| `cd [路径]` | 切换当前路径 (默认：/) | `cd /kafka`, `cd ..`, `cd brokers` |
+| `pwd` | 显示当前路径 | `pwd` |
 | `help`, `h`, `?` | 显示帮助 | `help` |
 | `quit`, `exit`, `q` | 退出 | `quit` |
 
