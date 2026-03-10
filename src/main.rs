@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
+use std::io::{self, BufRead, Write};
 
-/// Zookeeper文件系统命令行工具
+/// Zookeeper 文件系统命令行工具
 #[derive(Parser, Debug)]
 #[command(name = "zkfs")]
-#[command(about = "Zookeeper命令行工具", long_about = None)]
+#[command(about = "Zookeeper 命令行工具，支持交互模式", long_about = None)]
 struct Cli {
-    /// Zookeeper服务器地址 (例如: localhost:2181)
+    /// Zookeeper 服务器地址 (例如：localhost:2181)
     #[arg(short, long, env = "ZK_SERVER", default_value = "localhost:2181")]
     server: String,
 
@@ -15,37 +16,41 @@ struct Cli {
     #[arg(short, long, env = "ZK_TIMEOUT", default_value = "10")]
     timeout: u64,
 
+    /// 交互模式（类似 telnet，保持连接）
+    #[arg(short = 'i', long, default_value = "false")]
+    interactive: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
-    /// 列出指定路径下的子节点（类似ls命令）
+    /// 列出指定路径下的子节点（类似 ls 命令）
     Ls {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         #[arg(default_value = "/")]
         path: String,
     },
-    /// 列出指定路径下的子节点及详细信息（类似dir命令）
+    /// 列出指定路径下的子节点及详细信息（类似 dir 命令）
     Dir {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         #[arg(default_value = "/")]
         path: String,
     },
-    /// 显示节点数据内容（类似cat命令）
+    /// 显示节点数据内容（类似 cat 命令）
     Cat {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         path: String,
     },
-    /// 显示节点状态信息（类似stat命令）
+    /// 显示节点状态信息（类似 stat 命令）
     Stat {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         path: String,
     },
-    /// 删除节点（类似rm命令）
+    /// 删除节点（类似 rm 命令）
     Rm {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         path: String,
         /// 递归删除子节点
         #[arg(short, long)]
@@ -57,9 +62,9 @@ enum Commands {
     /// 创建节点
     #[command(alias = "add")]
     Create {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         path: String,
-        /// 节点数据（如果不指定则从--file读取，都不指定则为空数据）
+        /// 节点数据（如果不指定则从--file 读取，都不指定则为空数据）
         #[arg(short, long)]
         data: Option<String>,
         /// 从文件读取数据
@@ -71,47 +76,289 @@ enum Commands {
     },
     /// 设置节点数据
     Set {
-        /// Zookeeper路径
+        /// Zookeeper 路径
         path: String,
-        /// 节点数据（如果不指定则从--file读取）
+        /// 节点数据（如果不指定则从--file 读取）
         #[arg(short, long)]
         data: Option<String>,
         /// 从文件读取数据
         #[arg(short, long)]
         file: Option<String>,
     },
+    /// 退出交互模式
+    Quit,
+    /// 显示帮助信息
+    Help,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // 创建Zookeeper客户端
+    // 创建 Zookeeper 客户端
     let client = Client::connector()
         .connect(&cli.server)
         .await
-        .context("无法连接到Zookeeper服务器")?;
+        .context(format!("无法连接到 Zookeeper 服务器：{}", cli.server))?;
 
-    // 执行命令
-    match cli.command {
+    println!("✓ 已连接到 Zookeeper: {}", cli.server);
+
+    if cli.interactive {
+        // 交互模式
+        interactive_mode(&client).await?;
+    } else {
+        // 单次命令模式
+        match cli.command {
+            Some(cmd) => execute_command(&client, &cmd).await?,
+            None => {
+                println!("提示：使用 -i 或 --interactive 进入交互模式");
+                println!("使用 --help 查看可用命令");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 交互模式主循环
+async fn interactive_mode(client: &Client) -> Result<()> {
+    println!();
+    println!("交互式 Zookeeper 文件系统 (类似 telnet)");
+    println!("输入命令执行操作，输入 'quit' 或 'exit' 退出，输入 'help' 查看帮助");
+    println!();
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    loop {
+        print!("zkfs> ");
+        stdout.flush()?;
+
+        let mut input = String::new();
+        stdin.lock().read_line(&mut input)?;
+
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        // 解析命令
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let cmd = parts[0].to_lowercase();
+
+        // 检查退出命令
+        if cmd == "quit" || cmd == "exit" || cmd == "q" {
+            println!("再见！👋");
+            break;
+        }
+
+        // 检查帮助命令
+        if cmd == "help" || cmd == "h" || cmd == "?" {
+            print_help();
+            continue;
+        }
+
+        // 解析并执行命令
+        let command = parse_interactive_command(input);
+        match command {
+            Ok(cmd) => {
+                if let Err(e) = execute_command(client, &cmd).await {
+                    eprintln!("错误：{}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("命令解析错误：{}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 解析交互模式的命令输入
+fn parse_interactive_command(input: &str) -> Result<Commands> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(anyhow::anyhow!("空命令"));
+    }
+
+    let cmd = parts[0].to_lowercase();
+    let args = &parts[1..];
+
+    match cmd.as_str() {
+        "ls" => Ok(Commands::Ls {
+            path: args.first().copied().unwrap_or("/").to_string(),
+        }),
+        "dir" => Ok(Commands::Dir {
+            path: args.first().copied().unwrap_or("/").to_string(),
+        }),
+        "cat" => {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("cat 命令需要指定路径"));
+            }
+            Ok(Commands::Cat {
+                path: args[0].to_string(),
+            })
+        }
+        "stat" => {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("stat 命令需要指定路径"));
+            }
+            Ok(Commands::Stat {
+                path: args[0].to_string(),
+            })
+        }
+        "rm" => {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("rm 命令需要指定路径"));
+            }
+            let mut recursive = false;
+            let mut force = false;
+            let mut path = "";
+
+            for arg in args {
+                match *arg {
+                    "-r" | "--recursive" => recursive = true,
+                    "-f" | "--force" => force = true,
+                    _ => path = *arg,
+                }
+            }
+
+            if path.is_empty() {
+                return Err(anyhow::anyhow!("rm 命令需要指定路径"));
+            }
+
+            Ok(Commands::Rm {
+                path: path.to_string(),
+                recursive,
+                force,
+            })
+        }
+        "create" | "add" => {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("create 命令需要指定路径"));
+            }
+            let mut path = "";
+            let mut data = None;
+            let mut file = None;
+            let mut node_type = "persistent";
+
+            let mut i = 0;
+            while i < args.len() {
+                match args[i] {
+                    "-d" | "--data" => {
+                        if i + 1 < args.len() {
+                            data = Some(args[i + 1].to_string());
+                            i += 2;
+                        } else {
+                            return Err(anyhow::anyhow!("-d 需要参数"));
+                        }
+                    }
+                    "-f" | "--file" => {
+                        if i + 1 < args.len() {
+                            file = Some(args[i + 1].to_string());
+                            i += 2;
+                        } else {
+                            return Err(anyhow::anyhow!("-f 需要参数"));
+                        }
+                    }
+                    "-t" | "--node-type" => {
+                        if i + 1 < args.len() {
+                            node_type = args[i + 1];
+                            i += 2;
+                        } else {
+                            return Err(anyhow::anyhow!("-t 需要参数"));
+                        }
+                    }
+                    _ => {
+                        if path.is_empty() {
+                            path = args[i];
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            if path.is_empty() {
+                return Err(anyhow::anyhow!("create 命令需要指定路径"));
+            }
+
+            Ok(Commands::Create {
+                path: path.to_string(),
+                data,
+                file,
+                node_type: node_type.to_string(),
+            })
+        }
+        "set" => {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("set 命令需要指定路径"));
+            }
+            let mut path = "";
+            let mut data = None;
+            let mut file = None;
+
+            let mut i = 0;
+            while i < args.len() {
+                match args[i] {
+                    "-d" | "--data" => {
+                        if i + 1 < args.len() {
+                            data = Some(args[i + 1].to_string());
+                            i += 2;
+                        } else {
+                            return Err(anyhow::anyhow!("-d 需要参数"));
+                        }
+                    }
+                    "-f" | "--file" => {
+                        if i + 1 < args.len() {
+                            file = Some(args[i + 1].to_string());
+                            i += 2;
+                        } else {
+                            return Err(anyhow::anyhow!("-f 需要参数"));
+                        }
+                    }
+                    _ => {
+                        if path.is_empty() {
+                            path = args[i];
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            if path.is_empty() {
+                return Err(anyhow::anyhow!("set 命令需要指定路径"));
+            }
+
+            Ok(Commands::Set { path: path.to_string(), data, file })
+        }
+        "quit" | "exit" | "q" => Ok(Commands::Quit),
+        "help" | "h" | "?" => Ok(Commands::Help),
+        _ => Err(anyhow::anyhow!("未知命令：{}. 输入 'help' 查看可用命令", cmd)),
+    }
+}
+
+/// 执行命令
+async fn execute_command(client: &Client, command: &Commands) -> Result<()> {
+    match command {
         Commands::Ls { path } => {
-            ls_command(&client, &path).await?;
+            ls_command(client, path).await?;
         }
         Commands::Dir { path } => {
-            dir_command(&client, &path).await?;
+            dir_command(client, path).await?;
         }
         Commands::Cat { path } => {
-            cat_command(&client, &path).await?;
+            cat_command(client, path).await?;
         }
         Commands::Stat { path } => {
-            stat_command(&client, &path).await?;
+            stat_command(client, path).await?;
         }
         Commands::Rm {
             path,
             recursive,
             force,
         } => {
-            rm_command(&client, &path, recursive, force).await?;
+            rm_command(client, path, *recursive, *force).await?;
         }
         Commands::Create {
             path,
@@ -119,22 +366,49 @@ async fn main() -> Result<()> {
             file,
             node_type,
         } => {
-            create_command(&client, &path, data.as_deref(), file.as_deref(), &node_type).await?;
+            create_command(client, path, data.as_deref(), file.as_deref(), node_type).await?;
         }
         Commands::Set { path, data, file } => {
-            set_command(&client, &path, data.as_deref(), file.as_deref()).await?;
+            set_command(client, path, data.as_deref(), file.as_deref()).await?;
+        }
+        Commands::Quit => {
+            println!("再见！👋");
+        }
+        Commands::Help => {
+            print_help();
         }
     }
 
     Ok(())
 }
 
-/// ls命令：列出子节点
+/// 打印帮助信息
+fn print_help() {
+    println!();
+    println!("可用命令:");
+    println!("  ls [路径]              列出子节点 (默认：/)");
+    println!("  dir [路径]             列出子节点及详细信息 (默认：/)");
+    println!("  cat <路径>             显示节点数据");
+    println!("  stat <路径>            显示节点状态");
+    println!("  rm [-r] [-f] <路径>    删除节点 (-r 递归，-f 强制)");
+    println!("  create <路径> [选项]   创建节点");
+    println!("    -d, --data <数据>     节点数据");
+    println!("    -f, --file <文件>     从文件读取数据");
+    println!("    -t, --node-type <类型>  节点类型 (persistent/ephemeral/persistent-sequential/ephemeral-sequential)");
+    println!("  set <路径> [选项]      设置节点数据");
+    println!("    -d, --data <数据>     节点数据");
+    println!("    -f, --file <文件>     从文件读取数据");
+    println!("  help, h, ?             显示此帮助");
+    println!("  quit, exit, q          退出");
+    println!();
+}
+
+/// ls 命令：列出子节点
 async fn ls_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let children = session
         .list_children(path)
         .await
-        .context(format!("无法列出路径: {}", path))?;
+        .context(format!("无法列出路径：{}", path))?;
 
     for child in children {
         println!("{}", child);
@@ -143,25 +417,25 @@ async fn ls_command(session: &zookeeper_client::Client, path: &str) -> Result<()
     Ok(())
 }
 
-/// dir命令：列出子节点及详细信息
+/// dir 命令：列出子节点及详细信息
 async fn dir_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let children = session
         .list_children(path)
         .await
-        .context(format!("无法列出路径: {}", path))?;
+        .context(format!("无法列出路径：{}", path))?;
 
     // 获取当前路径的状态
     let stat = session
         .check_stat(path)
         .await
-        .context(format!("无法获取节点状态: {}", path))?
-        .context(format!("节点不存在: {}", path))?;
+        .context(format!("无法获取节点状态：{}", path))?
+        .context(format!("节点不存在：{}", path))?;
 
-    println!("路径: {}", path);
-    println!("子节点数量: {}", stat.num_children);
-    println!("数据版本: {}", stat.version);
-    println!("创建时间: {}", stat.ctime);
-    println!("修改时间: {}", stat.mtime);
+    println!("路径：{}", path);
+    println!("子节点数量：{}", stat.num_children);
+    println!("数据版本：{}", stat.version);
+    println!("创建时间：{}", stat.ctime);
+    println!("修改时间：{}", stat.mtime);
     println!("\n子节点列表:");
 
     for child in children {
@@ -175,7 +449,7 @@ async fn dir_command(session: &zookeeper_client::Client, path: &str) -> Result<(
         match session.check_stat(&child_path).await {
             Ok(Some(child_stat)) => {
                 println!(
-                    "  {} (版本: {}, 子节点: {}, 数据大小: {} bytes)",
+                    "  {} (版本：{}, 子节点：{}, 数据大小：{} bytes)",
                     child, child_stat.version, child_stat.num_children, child_stat.data_length
                 );
             }
@@ -191,20 +465,20 @@ async fn dir_command(session: &zookeeper_client::Client, path: &str) -> Result<(
     Ok(())
 }
 
-/// cat命令：显示节点数据
+/// cat 命令：显示节点数据
 async fn cat_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let (data, _stat) = session
         .get_data(path)
         .await
-        .context(format!("无法获取节点数据: {}", path))?;
+        .context(format!("无法获取节点数据：{}", path))?;
 
-    // 尝试将数据转换为UTF-8字符串
+    // 尝试将数据转换为 UTF-8 字符串
     match String::from_utf8(data.clone()) {
         Ok(text) => {
             println!("{}", text);
         }
         Err(_) => {
-            // 如果不是有效的UTF-8，显示十六进制
+            // 如果不是有效的 UTF-8，显示十六进制
             println!("(二进制数据，十六进制表示)");
             for chunk in data.chunks(16) {
                 for byte in chunk {
@@ -218,20 +492,20 @@ async fn cat_command(session: &zookeeper_client::Client, path: &str) -> Result<(
     Ok(())
 }
 
-/// stat命令：显示节点状态
+/// stat 命令：显示节点状态
 async fn stat_command(session: &zookeeper_client::Client, path: &str) -> Result<()> {
     let stat = session
         .check_stat(path)
         .await
-        .context(format!("无法获取节点状态: {}", path))?
-        .context(format!("节点不存在: {}", path))?;
+        .context(format!("无法获取节点状态：{}", path))?
+        .context(format!("节点不存在：{}", path))?;
 
     print_stat(path, &stat);
 
     Ok(())
 }
 
-/// create命令：创建节点
+/// create 命令：创建节点
 async fn create_command(
     session: &zookeeper_client::Client,
     path: &str,
@@ -245,14 +519,14 @@ async fn create_command(
     // 解析节点类型
     let create_mode = parse_create_mode(node_type)?;
 
-    // 创建节点选项（使用默认的anyone_all ACL）
+    // 创建节点选项（使用默认的 anyone_all ACL）
     let options = create_mode.with_acls(Acls::anyone_all());
 
     // 创建节点
     let (_stat, seq) = session
         .create(path, &data_bytes, &options)
         .await
-        .context(format!("无法创建节点: {}", path))?;
+        .context(format!("无法创建节点：{}", path))?;
 
     // 构造实际路径（如果是顺序节点，需要添加序列号）
     let seq_str = format!("{}", seq);
@@ -262,15 +536,15 @@ async fn create_command(
         format!("{}{}", path, seq)
     };
 
-    println!("成功创建节点: {}", actual_path);
+    println!("✓ 成功创建节点：{}", actual_path);
     if !data_bytes.is_empty() {
-        println!("写入数据: {} bytes", data_bytes.len());
+        println!("  写入数据：{} bytes", data_bytes.len());
     }
 
     Ok(())
 }
 
-/// set命令：设置节点数据
+/// set 命令：设置节点数据
 async fn set_command(
     session: &zookeeper_client::Client,
     path: &str,
@@ -280,14 +554,14 @@ async fn set_command(
     // 获取数据
     let data_bytes = get_data_from_input(data, file).await?;
 
-    // 设置节点数据（None表示不检查版本）
+    // 设置节点数据（None 表示不检查版本）
     session
         .set_data(path, &data_bytes, None)
         .await
-        .context(format!("无法设置节点数据: {}", path))?;
+        .context(format!("无法设置节点数据：{}", path))?;
 
-    println!("成功设置节点数据: {}", path);
-    println!("写入数据: {} bytes", data_bytes.len());
+    println!("✓ 成功设置节点数据：{}", path);
+    println!("  写入数据：{} bytes", data_bytes.len());
 
     Ok(())
 }
@@ -303,7 +577,7 @@ async fn get_data_from_input(data: Option<&str>, file: Option<&str>) -> Result<V
             // 从文件读取数据
             tokio::fs::read(f)
                 .await
-                .context(format!("无法读取文件: {}", f))
+                .context(format!("无法读取文件：{}", f))
         }
         (Some(_), Some(_)) => Err(anyhow::anyhow!("不能同时指定 --data 和 --file 参数")),
         (None, None) => {
@@ -321,13 +595,13 @@ fn parse_create_mode(node_type: &str) -> Result<CreateMode> {
         "persistent-sequential" | "ps" => Ok(CreateMode::PersistentSequential),
         "ephemeral-sequential" | "es" => Ok(CreateMode::EphemeralSequential),
         _ => Err(anyhow::anyhow!(
-            "无效的节点类型: {}. 支持的类型: persistent(p), ephemeral(e), persistent-sequential(ps), ephemeral-sequential(es)",
+            "无效的节点类型：{}. 支持的类型：persistent(p), ephemeral(e), persistent-sequential(ps), ephemeral-sequential(es)",
             node_type
         )),
     }
 }
 
-/// rm命令：删除节点
+/// rm 命令：删除节点
 async fn rm_command(
     session: &zookeeper_client::Client,
     path: &str,
@@ -338,11 +612,11 @@ async fn rm_command(
     if recursive {
         match delete_recursive(session, path, force).await {
             Ok(_) => {
-                println!("成功删除: {}", path);
+                println!("✓ 成功删除：{}", path);
                 Ok(())
             }
             Err(e) if force => {
-                println!("警告: 删除 {} 时出错: {}", path, e);
+                println!("⚠ 警告：删除 {} 时出错：{}", path, e);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -351,14 +625,14 @@ async fn rm_command(
         // 非递归删除
         match session.delete(path, None).await {
             Ok(_) => {
-                println!("成功删除: {}", path);
+                println!("✓ 成功删除：{}", path);
                 Ok(())
             }
             Err(e) if force => {
-                println!("警告: 删除 {} 时出错: {}", path, e);
+                println!("⚠ 警告：删除 {} 时出错：{}", path, e);
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点: {}", path))),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点：{}", path))),
         }
     }
 }
@@ -374,11 +648,11 @@ fn delete_recursive<'a>(
         let children = match session.list_children(path).await {
             Ok(children) => children,
             Err(e) if force => {
-                println!("警告: 无法列出 {} 的子节点: {}", path, e);
+                println!("⚠ 警告：无法列出 {} 的子节点：{}", path, e);
                 return Ok(());
             }
             Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!("无法列出路径: {}", path)));
+                return Err(anyhow::Error::from(e).context(format!("无法列出路径：{}", path)));
             }
         };
 
@@ -392,7 +666,7 @@ fn delete_recursive<'a>(
 
             if let Err(e) = delete_recursive(session, &child_path, force).await {
                 if force {
-                    println!("警告: 删除 {} 时出错: {}", child_path, e);
+                    println!("⚠ 警告：删除 {} 时出错：{}", child_path, e);
                 } else {
                     return Err(e);
                 }
@@ -403,26 +677,26 @@ fn delete_recursive<'a>(
         match session.delete(path, None).await {
             Ok(_) => Ok(()),
             Err(e) if force => {
-                println!("警告: 删除 {} 时出错: {}", path, e);
+                println!("⚠ 警告：删除 {} 时出错：{}", path, e);
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点: {}", path))),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("无法删除节点：{}", path))),
         }
     })
 }
 
 /// 打印节点状态信息
 fn print_stat(path: &str, stat: &Stat) {
-    println!("节点路径: {}", path);
-    println!("创建事务ID: {}", stat.czxid);
-    println!("修改事务ID: {}", stat.mzxid);
-    println!("创建时间: {}", stat.ctime);
-    println!("修改时间: {}", stat.mtime);
-    println!("数据版本: {}", stat.version);
-    println!("子节点版本: {}", stat.cversion);
-    println!("ACL版本: {}", stat.aversion);
-    println!("临时节点所有者: {}", stat.ephemeral_owner);
-    println!("数据长度: {} bytes", stat.data_length);
-    println!("子节点数量: {}", stat.num_children);
-    println!("子节点修改事务ID: {}", stat.pzxid);
+    println!("节点路径：{}", path);
+    println!("创建事务 ID: {}", stat.czxid);
+    println!("修改事务 ID: {}", stat.mzxid);
+    println!("创建时间：{}", stat.ctime);
+    println!("修改时间：{}", stat.mtime);
+    println!("数据版本：{}", stat.version);
+    println!("子节点版本：{}", stat.cversion);
+    println!("ACL 版本：{}", stat.aversion);
+    println!("临时节点所有者：{}", stat.ephemeral_owner);
+    println!("数据长度：{} bytes", stat.data_length);
+    println!("子节点数量：{}", stat.num_children);
+    println!("子节点修改事务 ID: {}", stat.pzxid);
 }
