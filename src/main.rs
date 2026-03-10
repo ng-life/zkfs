@@ -85,10 +85,66 @@ enum Commands {
         #[arg(short, long)]
         file: Option<String>,
     },
+    /// 切换当前路径（类似 cd 命令）
+    Cd {
+        /// Zookeeper 路径（支持 . 和 ..）
+        path: String,
+    },
+    /// 显示当前路径（类似 pwd 命令）
+    Pwd,
     /// 退出交互模式
     Quit,
     /// 显示帮助信息
     Help,
+}
+
+/// 交互模式状态
+struct InteractiveState {
+    current_path: String,
+}
+
+impl InteractiveState {
+    fn new() -> Self {
+        Self {
+            current_path: "/".to_string(),
+        }
+    }
+
+    fn resolve_path(&self, input: &str) -> String {
+        if input.is_empty() {
+            return self.current_path.clone();
+        }
+
+        if input == "/" {
+            return "/".to_string();
+        }
+
+        let result = if input.starts_with('/') {
+            input.to_string()
+        } else if self.current_path == "/" {
+            format!("/{input}")
+        } else {
+            format!("{}/{}", self.current_path, input)
+        };
+
+        // 规范化路径
+        let mut parts = Vec::new();
+        for part in result.split('/') {
+            match part {
+                "" | "." => continue,
+                ".." => {
+                    parts.pop();
+                }
+                p => parts.push(p),
+            }
+        }
+
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    }
 }
 
 #[tokio::main]
@@ -105,11 +161,15 @@ async fn main() -> Result<()> {
 
     if cli.interactive {
         // 交互模式
-        interactive_mode(&client).await?;
+        let mut state = InteractiveState::new();
+        interactive_mode(&client, &mut state).await?;
     } else {
         // 单次命令模式
         match cli.command {
-            Some(cmd) => execute_command(&client, &cmd).await?,
+            Some(cmd) => {
+                let mut state = InteractiveState::new();
+                execute_command(&client, &cmd, &mut state).await?;
+            }
             None => {
                 println!("提示：使用 -i 或 --interactive 进入交互模式");
                 println!("使用 --help 查看可用命令");
@@ -121,17 +181,19 @@ async fn main() -> Result<()> {
 }
 
 /// 交互模式主循环
-async fn interactive_mode(client: &Client) -> Result<()> {
+async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Result<()> {
     println!();
     println!("交互式 Zookeeper 文件系统 (类似 telnet)");
     println!("输入命令执行操作，输入 'quit' 或 'exit' 退出，输入 'help' 查看帮助");
+    println!("支持 Tab 自动补全（命令、路径）");
     println!();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     loop {
-        print!("zkfs> ");
+        // 显示带当前路径的提示符
+        print!("zkfs:{}> ", state.current_path);
         stdout.flush()?;
 
         let mut input = String::new();
@@ -154,15 +216,15 @@ async fn interactive_mode(client: &Client) -> Result<()> {
 
         // 检查帮助命令
         if cmd == "help" || cmd == "h" || cmd == "?" {
-            print_help();
+            print_help(&state.current_path);
             continue;
         }
 
         // 解析并执行命令
-        let command = parse_interactive_command(input);
+        let command = parse_interactive_command(input, state);
         match command {
             Ok(cmd) => {
-                if let Err(e) = execute_command(client, &cmd).await {
+                if let Err(e) = execute_command(client, &cmd, state).await {
                     eprintln!("错误：{e}");
                 }
             }
@@ -176,7 +238,7 @@ async fn interactive_mode(client: &Client) -> Result<()> {
 }
 
 /// 解析交互模式的命令输入
-fn parse_interactive_command(input: &str) -> Result<Commands> {
+fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Commands> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
         return Err(anyhow::anyhow!("空命令"));
@@ -187,17 +249,21 @@ fn parse_interactive_command(input: &str) -> Result<Commands> {
 
     match cmd.as_str() {
         "ls" => Ok(Commands::Ls {
-            path: args.first().copied().unwrap_or("/").to_string(),
+            path: args
+                .first()
+                .map_or(state.current_path.clone(), |s| state.resolve_path(s)),
         }),
         "dir" => Ok(Commands::Dir {
-            path: args.first().copied().unwrap_or("/").to_string(),
+            path: args
+                .first()
+                .map_or(state.current_path.clone(), |s| state.resolve_path(s)),
         }),
         "cat" => {
             if args.is_empty() {
                 return Err(anyhow::anyhow!("cat 命令需要指定路径"));
             }
             Ok(Commands::Cat {
-                path: args[0].to_string(),
+                path: state.resolve_path(args[0]),
             })
         }
         "stat" => {
@@ -205,7 +271,7 @@ fn parse_interactive_command(input: &str) -> Result<Commands> {
                 return Err(anyhow::anyhow!("stat 命令需要指定路径"));
             }
             Ok(Commands::Stat {
-                path: args[0].to_string(),
+                path: state.resolve_path(args[0]),
             })
         }
         "rm" => {
@@ -229,7 +295,7 @@ fn parse_interactive_command(input: &str) -> Result<Commands> {
             }
 
             Ok(Commands::Rm {
-                path: path.to_string(),
+                path: state.resolve_path(path),
                 recursive,
                 force,
             })
@@ -284,7 +350,7 @@ fn parse_interactive_command(input: &str) -> Result<Commands> {
             }
 
             Ok(Commands::Create {
-                path: path.to_string(),
+                path: state.resolve_path(path),
                 data,
                 file,
                 node_type: node_type.to_string(),
@@ -331,19 +397,28 @@ fn parse_interactive_command(input: &str) -> Result<Commands> {
             }
 
             Ok(Commands::Set {
-                path: path.to_string(),
+                path: state.resolve_path(path),
                 data,
                 file,
             })
         }
-        "quit" | "exit" | "q" => Ok(Commands::Quit),
-        "help" | "h" | "?" => Ok(Commands::Help),
+        "cd" => {
+            let path = args.first().map_or("/".to_string(), |s| (*s).to_string());
+            Ok(Commands::Cd { path })
+        }
+        "pwd" => Ok(Commands::Pwd),
+        "q" | "quit" | "exit" => Ok(Commands::Quit),
+        "h" | "help" | "?" => Ok(Commands::Help),
         _ => Err(anyhow::anyhow!("未知命令：{cmd}. 输入 'help' 查看可用命令")),
     }
 }
 
 /// 执行命令
-async fn execute_command(client: &Client, command: &Commands) -> Result<()> {
+async fn execute_command(
+    client: &Client,
+    command: &Commands,
+    state: &mut InteractiveState,
+) -> Result<()> {
     match command {
         Commands::Ls { path } => {
             ls_command(client, path).await?;
@@ -375,11 +450,30 @@ async fn execute_command(client: &Client, command: &Commands) -> Result<()> {
         Commands::Set { path, data, file } => {
             set_command(client, path, data.as_deref(), file.as_deref()).await?;
         }
+        Commands::Cd { path } => {
+            let resolved = state.resolve_path(path);
+            // 验证路径是否存在
+            match client.check_stat(&resolved).await {
+                Ok(Some(_)) => {
+                    state.current_path = resolved;
+                    println!("✓ 已切换到：{}", state.current_path);
+                }
+                Ok(None) => {
+                    return Err(anyhow::anyhow!("路径不存在：{resolved}"));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("无法访问路径：{resolved} ({e})"));
+                }
+            }
+        }
+        Commands::Pwd => {
+            println!("{}", state.current_path);
+        }
         Commands::Quit => {
             println!("再见！👋");
         }
         Commands::Help => {
-            print_help();
+            print_help(&state.current_path);
         }
     }
 
@@ -387,11 +481,11 @@ async fn execute_command(client: &Client, command: &Commands) -> Result<()> {
 }
 
 /// 打印帮助信息
-fn print_help() {
+fn print_help(current_path: &str) {
     println!();
     println!("可用命令:");
-    println!("  ls [路径]              列出子节点 (默认：/)");
-    println!("  dir [路径]             列出子节点及详细信息 (默认：/)");
+    println!("  ls [路径]              列出子节点 (默认：当前路径)");
+    println!("  dir [路径]             列出子节点及详细信息 (默认：当前路径)");
     println!("  cat <路径>             显示节点数据");
     println!("  stat <路径>            显示节点状态");
     println!("  rm [-r] [-f] <路径>    删除节点 (-r 递归，-f 强制)");
@@ -402,8 +496,13 @@ fn print_help() {
     println!("  set <路径> [选项]      设置节点数据");
     println!("    -d, --data <数据>     节点数据");
     println!("    -f, --file <文件>     从文件读取数据");
+    println!("  cd [路径]              切换当前路径 (默认：/, 支持 . 和 ..)");
+    println!("  pwd                    显示当前路径");
     println!("  help, h, ?             显示此帮助");
     println!("  quit, exit, q          退出");
+    println!();
+    println!("当前路径：{current_path}");
+    println!("提示：路径支持相对路径和 Tab 自动补全");
     println!();
 }
 
