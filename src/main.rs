@@ -7,6 +7,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context as RlContext, Helper, Result as RlResult, Config, Editor};
 use rustyline::error::ReadlineError;
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
 
 /// Zookeeper 文件系统命令行工具
@@ -112,10 +113,12 @@ struct InteractiveState {
 /// Tab 补全器
 struct ZkFsCompleter {
     commands: BTreeSet<&'static str>,
+    client: Arc<Client>,
+    current_path: Arc<Mutex<String>>,
 }
 
 impl ZkFsCompleter {
-    fn new() -> Self {
+    fn new(client: Arc<Client>, current_path: Arc<Mutex<String>>) -> Self {
         let mut commands = BTreeSet::new();
         commands.insert("ls");
         commands.insert("dir");
@@ -134,7 +137,68 @@ impl ZkFsCompleter {
         commands.insert("h");
         commands.insert("ll");
         
-        Self { commands }
+        Self { commands, client, current_path }
+    }
+    
+    /// 获取路径补全建议
+    fn complete_path(&self, partial: &str) -> Vec<String> {
+        let current_path = self.current_path.lock().unwrap().clone();
+        
+        // 解析路径：获取基础路径和部分名称
+        let (base_path, partial_name) = if partial.is_empty() {
+            (current_path, String::new())
+        } else if partial == "/" || partial == "/." || partial == "/.." {
+            ("/".to_string(), String::new())
+        } else {
+            let path = if partial.starts_with('/') {
+                partial.to_string()
+            } else if current_path == "/" {
+                format!("/{partial}")
+            } else {
+                format!("{current_path}/{partial}")
+            };
+            
+            // 找到最后一个 / 的位置
+            if let Some(last_slash) = path.rfind('/') {
+                let base = if last_slash == 0 { 
+                    "/".to_string() 
+                } else { 
+                    path[..last_slash].to_string() 
+                };
+                let name = path[last_slash + 1..].to_string();
+                (base, name)
+            } else {
+                (current_path, partial.to_string())
+            }
+        };
+        
+        // 使用 tokio 运行时执行异步操作
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return vec![],
+        };
+        
+        let client = self.client.clone();
+        let children = rt.block_on(async {
+            client.list_children(&base_path).await.unwrap_or_default()
+        });
+        
+        // 过滤匹配的子节点（支持 . 和 ..）
+        let mut matches: Vec<String> = children
+            .into_iter()
+            .filter(|name| name.starts_with(&partial_name))
+            .collect();
+        
+        // 添加 . 和 .. 如果匹配
+        if ".".starts_with(&partial_name) && !partial_name.is_empty() {
+            matches.push(".".to_string());
+        }
+        if "..".starts_with(&partial_name) && !partial_name.is_empty() {
+            matches.push("..".to_string());
+        }
+        
+        matches.sort();
+        matches
     }
 }
 
@@ -156,7 +220,18 @@ impl Completer for ZkFsCompleter {
             return Ok((start, matches));
         }
         
-        // 路径补全在外部处理
+        // 解析命令，判断是否需要路径补全
+        let before_word = line[..start].trim();
+        let first_word = before_word.split_whitespace().next().unwrap_or("").to_lowercase();
+        
+        // 需要路径补全的命令
+        let path_commands = ["ls", "dir", "cat", "stat", "rm", "create", "add", "set", "cd"];
+        
+        if path_commands.contains(&first_word.as_str()) {
+            let matches = self.complete_path(word);
+            return Ok((start, matches));
+        }
+        
         Ok((start, vec![]))
     }
 }
@@ -175,170 +250,45 @@ impl Validator for ZkFsCompleter {}
 
 
 
-impl InteractiveState {
-    fn new() -> Self {
-        Self {
-            current_path: "/".to_string(),
-        }
+/// 使用共享路径解析路径
+fn resolve_path_with_current(current_path: &str, input: &str) -> String {
+    if input.is_empty() {
+        return current_path.to_string();
     }
 
-    fn resolve_path(&self, input: &str) -> String {
-        if input.is_empty() {
-            return self.current_path.clone();
-        }
-
-        if input == "/" {
-            return "/".to_string();
-        }
-
-        let result = if input.starts_with('/') {
-            input.to_string()
-        } else if self.current_path == "/" {
-            format!("/{input}")
-        } else {
-            format!("{}/{}", self.current_path, input)
-        };
-
-        // 规范化路径
-        let mut parts = Vec::new();
-        for part in result.split('/') {
-            match part {
-                "" | "." => continue,
-                ".." => {
-                    parts.pop();
-                }
-                p => parts.push(p),
-            }
-        }
-
-        if parts.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", parts.join("/"))
-        }
+    if input == "/" {
+        return "/".to_string();
     }
-}
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // 创建 Zookeeper 客户端
-    let client = Client::connector()
-        .connect(&cli.server)
-        .await
-        .context(format!("无法连接到 Zookeeper 服务器：{}", cli.server))?;
-
-    println!("✓ 已连接到 Zookeeper: {}", cli.server);
-
-    if cli.interactive {
-        // 交互模式
-        let mut state = InteractiveState::new();
-        interactive_mode(&client, &mut state).await?;
+    let result = if input.starts_with('/') {
+        input.to_string()
+    } else if current_path == "/" {
+        format!("/{input}")
     } else {
-        // 单次命令模式
-        match cli.command {
-            Some(cmd) => {
-                let mut state = InteractiveState::new();
-                execute_command(&client, &cmd, &mut state).await?;
+        format!("{current_path}/{input}")
+    };
+
+    // 规范化路径
+    let mut parts = Vec::new();
+    for part in result.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                parts.pop();
             }
-            None => {
-                println!("提示：使用 -i 或 --interactive 进入交互模式");
-                println!("使用 --help 查看可用命令");
-            }
+            p => parts.push(p),
         }
     }
 
-    Ok(())
-}
-
-/// 交互模式主循环（带 Tab 补全）
-async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Result<()> {
-    println!();
-    println!("交互式 Zookeeper 文件系统 (类似 telnet)");
-    println!("输入命令执行操作，输入 'quit' 或 'exit' 退出，输入 'help' 查看帮助");
-    println!("支持 Tab 自动补全（命令、路径）");
-    println!();
-
-    // 设置 rustyline 编辑器
-    let config = Config::builder()
-        .completion_type(rustyline::CompletionType::Circular)
-        .build();
-    
-    let mut rl = Editor::<ZkFsCompleter, _>::with_config(config)?;
-    
-    let completer = ZkFsCompleter::new();
-    rl.set_helper(Some(completer));
-    
-    // 加载历史记录
-    let _ = rl.load_history(".zkfs_history");
-    
-    loop {
-        let prompt = format!("zkfs:{}> ", state.current_path);
-        
-        match rl.readline(&prompt) {
-            Ok(input) => {
-                // 添加到历史记录
-                rl.add_history_entry(input.clone())?;
-                
-                let input = input.trim();
-                if input.is_empty() {
-                    continue;
-                }
-
-                // 解析命令
-                let parts: Vec<&str> = input.split_whitespace().collect();
-                let cmd = parts[0].to_lowercase();
-
-                // 检查退出命令
-                if cmd == "quit" || cmd == "exit" || cmd == "q" {
-                    // 保存历史记录
-                    let _ = rl.save_history(".zkfs_history");
-                    println!("再见！👋");
-                    break;
-                }
-
-                // 检查帮助命令
-                if cmd == "help" || cmd == "h" || cmd == "?" {
-                    print_help(&state.current_path);
-                    continue;
-                }
-
-                // 解析并执行命令
-                let command = parse_interactive_command(input, state);
-                match command {
-                    Ok(cmd) => {
-                        if let Err(e) = execute_command(client, &cmd, state).await {
-                            eprintln!("错误：{e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("命令解析错误：{e}");
-                    }
-                }
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("按 Ctrl+C 退出。使用 'quit' 命令退出。");
-            }
-            Err(ReadlineError::Eof) => {
-                println!("再见！👋");
-                break;
-            }
-            Err(err) => {
-                eprintln!("读取错误：{err}");
-                break;
-            }
-        }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
     }
-    
-    // 保存历史记录
-    let _ = rl.save_history(".zkfs_history");
-
-    Ok(())
 }
 
-/// 解析交互模式的命令输入
-fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Commands> {
+/// 解析交互模式的命令输入（使用共享路径）
+fn parse_interactive_command_with_path(input: &str, current_path: &Arc<Mutex<String>>) -> Result<Commands> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
         return Err(anyhow::anyhow!("空命令"));
@@ -346,24 +296,25 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
 
     let cmd = parts[0].to_lowercase();
     let args = &parts[1..];
+    let current = current_path.lock().unwrap().clone();
 
     match cmd.as_str() {
         "ls" => Ok(Commands::Ls {
             path: args
                 .first()
-                .map_or(state.current_path.clone(), |s| state.resolve_path(s)),
+                .map_or(current.clone(), |s| resolve_path_with_current(&current, s)),
         }),
         "dir" => Ok(Commands::Dir {
             path: args
                 .first()
-                .map_or(state.current_path.clone(), |s| state.resolve_path(s)),
+                .map_or(current.clone(), |s| resolve_path_with_current(&current, s)),
         }),
         "cat" => {
             if args.is_empty() {
                 return Err(anyhow::anyhow!("cat 命令需要指定路径"));
             }
             Ok(Commands::Cat {
-                path: state.resolve_path(args[0]),
+                path: resolve_path_with_current(&current, args[0]),
             })
         }
         "stat" => {
@@ -371,7 +322,7 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
                 return Err(anyhow::anyhow!("stat 命令需要指定路径"));
             }
             Ok(Commands::Stat {
-                path: state.resolve_path(args[0]),
+                path: resolve_path_with_current(&current, args[0]),
             })
         }
         "rm" => {
@@ -395,7 +346,7 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
             }
 
             Ok(Commands::Rm {
-                path: state.resolve_path(path),
+                path: resolve_path_with_current(&current, path),
                 recursive,
                 force,
             })
@@ -450,7 +401,7 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
             }
 
             Ok(Commands::Create {
-                path: state.resolve_path(path),
+                path: resolve_path_with_current(&current, path),
                 data,
                 file,
                 node_type: node_type.to_string(),
@@ -497,7 +448,7 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
             }
 
             Ok(Commands::Set {
-                path: state.resolve_path(path),
+                path: resolve_path_with_current(&current, path),
                 data,
                 file,
             })
@@ -513,11 +464,149 @@ fn parse_interactive_command(input: &str, state: &InteractiveState) -> Result<Co
     }
 }
 
-/// 执行命令
+impl InteractiveState {
+    fn new() -> Self {
+        Self {
+            current_path: "/".to_string(),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // 创建 Zookeeper 客户端
+    let client = Client::connector()
+        .connect(&cli.server)
+        .await
+        .context(format!("无法连接到 Zookeeper 服务器：{}", cli.server))?;
+
+    println!("✓ 已连接到 Zookeeper: {}", cli.server);
+
+    if cli.interactive {
+        // 交互模式
+        let mut state = InteractiveState::new();
+        interactive_mode(&client, &mut state).await?;
+    } else {
+        // 单次命令模式
+        match cli.command {
+            Some(cmd) => {
+                let current_path = Arc::new(Mutex::new("/".to_string()));
+                execute_command(&client, &cmd, &current_path).await?;
+            }
+            None => {
+                println!("提示：使用 -i 或 --interactive 进入交互模式");
+                println!("使用 --help 查看可用命令");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 交互模式主循环（带 Tab 补全）
+async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Result<()> {
+    println!();
+    println!("交互式 Zookeeper 文件系统 (类似 telnet)");
+    println!("输入命令执行操作，输入 'quit' 或 'exit' 退出，输入 'help' 查看帮助");
+    println!("支持 Tab 自动补全（命令、ZooKeeper 路径）");
+    println!();
+
+    // 创建共享的当前路径
+    let current_path = Arc::new(Mutex::new(state.current_path.clone()));
+    let client_arc = Arc::new(client.clone());
+    
+    // 设置 rustyline 编辑器
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::Circular)
+        .build();
+    
+    let mut rl = Editor::<ZkFsCompleter, _>::with_config(config)?;
+    
+    let completer = ZkFsCompleter::new(client_arc.clone(), current_path.clone());
+    rl.set_helper(Some(completer));
+    
+    // 加载历史记录
+    let _ = rl.load_history(".zkfs_history");
+    
+    loop {
+        let path = current_path.lock().unwrap().clone();
+        let prompt = format!("zkfs:{}> ", path);
+        
+        match rl.readline(&prompt) {
+            Ok(input) => {
+                // 添加到历史记录
+                rl.add_history_entry(input.clone())?;
+                
+                let input = input.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                // 解析命令
+                let parts: Vec<&str> = input.split_whitespace().collect();
+                let cmd = parts[0].to_lowercase();
+
+                // 检查退出命令
+                if cmd == "quit" || cmd == "exit" || cmd == "q" {
+                    // 保存历史记录
+                    let _ = rl.save_history(".zkfs_history");
+                    println!("再见！👋");
+                    break;
+                }
+
+                // 检查帮助命令
+                if cmd == "help" || cmd == "h" || cmd == "?" {
+                    let path = current_path.lock().unwrap().clone();
+                    print_help(&path);
+                    continue;
+                }
+
+                // 解析并执行命令
+                let command = parse_interactive_command_with_path(input, &current_path);
+                match command {
+                    Ok(cmd) => {
+                        // 如果是 cd 命令，需要更新当前路径
+                        if let Commands::Cd { path: new_path } = &cmd {
+                            let resolved = resolve_path_with_current(&current_path.lock().unwrap(), new_path);
+                            *current_path.lock().unwrap() = resolved;
+                        }
+                        
+                        if let Err(e) = execute_command(client, &cmd, &current_path).await {
+                            eprintln!("错误：{e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("命令解析错误：{e}");
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("按 Ctrl+C 退出。使用 'quit' 命令退出。");
+            }
+            Err(ReadlineError::Eof) => {
+                println!("再见！👋");
+                break;
+            }
+            Err(err) => {
+                eprintln!("读取错误：{err}");
+                break;
+            }
+        }
+    }
+    
+    // 保存历史记录
+    let _ = rl.save_history(".zkfs_history");
+
+    Ok(())
+}
+
+/// 执行命令（使用共享路径）
 async fn execute_command(
     client: &Client,
     command: &Commands,
-    state: &mut InteractiveState,
+    current_path: &Arc<Mutex<String>>,
 ) -> Result<()> {
     match command {
         Commands::Ls { path } => {
@@ -551,12 +640,13 @@ async fn execute_command(
             set_command(client, path, data.as_deref(), file.as_deref()).await?;
         }
         Commands::Cd { path } => {
-            let resolved = state.resolve_path(path);
+            let current = current_path.lock().unwrap().clone();
+            let resolved = resolve_path_with_current(&current, path);
             // 验证路径是否存在
             match client.check_stat(&resolved).await {
                 Ok(Some(_)) => {
-                    state.current_path = resolved;
-                    println!("✓ 已切换到：{}", state.current_path);
+                    *current_path.lock().unwrap() = resolved.clone();
+                    println!("✓ 已切换到：{}", resolved);
                 }
                 Ok(None) => {
                     return Err(anyhow::anyhow!("路径不存在：{resolved}"));
@@ -567,13 +657,13 @@ async fn execute_command(
             }
         }
         Commands::Pwd => {
-            println!("{}", state.current_path);
+            println!("{}", *current_path.lock().unwrap());
         }
         Commands::Quit => {
             println!("再见！👋");
         }
         Commands::Help => {
-            print_help(&state.current_path);
+            print_help(&current_path.lock().unwrap());
         }
     }
 
