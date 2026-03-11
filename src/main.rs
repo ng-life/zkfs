@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use rustyline::{Context as RlContext, Helper, Result as RlResult, Config, Editor};
-use rustyline::error::ReadlineError;
+use rustyline::{Config, Context as RlContext, Editor, Helper, Result as RlResult};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
@@ -136,31 +136,34 @@ impl ZkFsCompleter {
         commands.insert("help");
         commands.insert("h");
         commands.insert("ll");
-        
-        Self { commands, client, current_path }
+
+        Self {
+            commands,
+            client,
+            current_path,
+        }
     }
-    
+
     /// 获取路径补全建议
     fn complete_path(&self, partial: &str) -> Vec<String> {
         let current_path = self.current_path.lock().unwrap().clone();
-        
+
         // 解析路径：获取基础路径和部分名称
         let (base_path, partial_name) = Self::parse_completion_path(&current_path, partial);
-        
+
         // 使用 block_in_place 在 async 上下文中执行阻塞操作
         let client = self.client.clone();
         let children = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                client.list_children(&base_path).await.unwrap_or_default()
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { client.list_children(&base_path).await.unwrap_or_default() })
         });
-        
+
         // 过滤匹配的子节点
         let mut matches: Vec<String> = children
             .into_iter()
             .filter(|name| name.starts_with(&partial_name))
             .collect();
-        
+
         // 添加 . 和 .. 如果匹配（只在有输入时）
         if !partial_name.is_empty() {
             if ".".starts_with(&partial_name) {
@@ -170,23 +173,23 @@ impl ZkFsCompleter {
                 matches.push("..".to_string());
             }
         }
-        
+
         matches.sort();
         matches
     }
-    
+
     /// 解析补全路径，返回 (基础路径，待补全的名称)
     fn parse_completion_path(current_path: &str, partial: &str) -> (String, String) {
         if partial.is_empty() {
             // 空输入：补全当前目录下的所有节点
             return (current_path.to_string(), String::new());
         }
-        
+
         if partial == "/" {
             // 根目录
             return ("/".to_string(), String::new());
         }
-        
+
         // 构建完整路径
         let full_path = if partial.starts_with('/') {
             // 绝对路径
@@ -198,7 +201,7 @@ impl ZkFsCompleter {
             // 相对路径
             format!("{current_path}/{partial}")
         };
-        
+
         // 分离目录和文件名
         if let Some(last_slash) = full_path.rfind('/') {
             let base = if last_slash == 0 {
@@ -216,41 +219,55 @@ impl ZkFsCompleter {
 
 impl Completer for ZkFsCompleter {
     type Candidate = String;
-    
-    fn complete(&self, line: &str, pos: usize, _ctx: &RlContext<'_>) -> RlResult<(usize, Vec<String>)> {
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RlContext<'_>,
+    ) -> RlResult<(usize, Vec<String>)> {
         // 找到当前单词的起始位置
-        let start = line[..pos].rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+        let start = line[..pos]
+            .rfind(|c: char| c.is_whitespace())
+            .map_or(0, |i| i + 1);
         let word = &line[start..pos];
-        
+
         // 如果是第一个单词（命令），进行命令补全
         if start == 0 || line[..start].trim().is_empty() {
-            let matches: Vec<String> = self.commands
+            let matches: Vec<String> = self
+                .commands
                 .iter()
                 .filter(|cmd| cmd.starts_with(word))
                 .map(|cmd| cmd.to_string())
                 .collect();
             return Ok((start, matches));
         }
-        
+
         // 解析命令，判断是否需要路径补全
         let before_word = line[..start].trim();
-        let first_word = before_word.split_whitespace().next().unwrap_or("").to_lowercase();
-        
+        let first_word = before_word
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
         // 需要路径补全的命令
-        let path_commands = ["ls", "dir", "cat", "stat", "rm", "create", "add", "set", "cd"];
-        
+        let path_commands = [
+            "ls", "dir", "cat", "stat", "rm", "create", "add", "set", "cd",
+        ];
+
         if path_commands.contains(&first_word.as_str()) {
             let matches = self.complete_path(word);
             return Ok((start, matches));
         }
-        
+
         Ok((start, vec![]))
     }
 }
 
 impl Hinter for ZkFsCompleter {
     type Hint = String;
-    
+
     fn hint(&self, _line: &str, _pos: usize, _ctx: &RlContext<'_>) -> Option<Self::Hint> {
         None
     }
@@ -259,8 +276,6 @@ impl Hinter for ZkFsCompleter {
 impl Helper for ZkFsCompleter {}
 impl Highlighter for ZkFsCompleter {}
 impl Validator for ZkFsCompleter {}
-
-
 
 /// 使用共享路径解析路径
 fn resolve_path_with_current(current_path: &str, input: &str) -> String {
@@ -300,7 +315,10 @@ fn resolve_path_with_current(current_path: &str, input: &str) -> String {
 }
 
 /// 解析交互模式的命令输入（使用共享路径）
-fn parse_interactive_command_with_path(input: &str, current_path: &Arc<Mutex<String>>) -> Result<Commands> {
+fn parse_interactive_command_with_path(
+    input: &str,
+    current_path: &Arc<Mutex<String>>,
+) -> Result<Commands> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
         return Err(anyhow::anyhow!("空命令"));
@@ -528,29 +546,29 @@ async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Resu
     // 创建共享的当前路径
     let current_path = Arc::new(Mutex::new(state.current_path.clone()));
     let client_arc = Arc::new(client.clone());
-    
+
     // 设置 rustyline 编辑器
     let config = Config::builder()
         .completion_type(rustyline::CompletionType::Circular)
         .build();
-    
+
     let mut rl = Editor::<ZkFsCompleter, _>::with_config(config)?;
-    
+
     let completer = ZkFsCompleter::new(client_arc.clone(), current_path.clone());
     rl.set_helper(Some(completer));
-    
+
     // 加载历史记录
     let _ = rl.load_history(".zkfs_history");
-    
+
     loop {
         let path = current_path.lock().unwrap().clone();
         let prompt = format!("zkfs:{}> ", path);
-        
+
         match rl.readline(&prompt) {
             Ok(input) => {
                 // 添加到历史记录
                 rl.add_history_entry(input.clone())?;
-                
+
                 let input = input.trim();
                 if input.is_empty() {
                     continue;
@@ -581,10 +599,11 @@ async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Resu
                     Ok(cmd) => {
                         // 如果是 cd 命令，需要更新当前路径
                         if let Commands::Cd { path: new_path } = &cmd {
-                            let resolved = resolve_path_with_current(&current_path.lock().unwrap(), new_path);
+                            let resolved =
+                                resolve_path_with_current(&current_path.lock().unwrap(), new_path);
                             *current_path.lock().unwrap() = resolved;
                         }
-                        
+
                         if let Err(e) = execute_command(client, &cmd, &current_path).await {
                             eprintln!("错误：{e}");
                         }
@@ -607,7 +626,7 @@ async fn interactive_mode(client: &Client, state: &mut InteractiveState) -> Resu
             }
         }
     }
-    
+
     // 保存历史记录
     let _ = rl.save_history(".zkfs_history");
 
