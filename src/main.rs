@@ -145,32 +145,7 @@ impl ZkFsCompleter {
         let current_path = self.current_path.lock().unwrap().clone();
         
         // 解析路径：获取基础路径和部分名称
-        let (base_path, partial_name) = if partial.is_empty() {
-            (current_path, String::new())
-        } else if partial == "/" || partial == "/." || partial == "/.." {
-            ("/".to_string(), String::new())
-        } else {
-            let path = if partial.starts_with('/') {
-                partial.to_string()
-            } else if current_path == "/" {
-                format!("/{partial}")
-            } else {
-                format!("{current_path}/{partial}")
-            };
-            
-            // 找到最后一个 / 的位置
-            if let Some(last_slash) = path.rfind('/') {
-                let base = if last_slash == 0 { 
-                    "/".to_string() 
-                } else { 
-                    path[..last_slash].to_string() 
-                };
-                let name = path[last_slash + 1..].to_string();
-                (base, name)
-            } else {
-                (current_path, partial.to_string())
-            }
-        };
+        let (base_path, partial_name) = Self::parse_completion_path(&current_path, partial);
         
         // 使用 block_in_place 在 async 上下文中执行阻塞操作
         let client = self.client.clone();
@@ -180,22 +155,62 @@ impl ZkFsCompleter {
             })
         });
         
-        // 过滤匹配的子节点（支持 . 和 ..）
+        // 过滤匹配的子节点
         let mut matches: Vec<String> = children
             .into_iter()
             .filter(|name| name.starts_with(&partial_name))
             .collect();
         
-        // 添加 . 和 .. 如果匹配
-        if ".".starts_with(&partial_name) && !partial_name.is_empty() {
-            matches.push(".".to_string());
-        }
-        if "..".starts_with(&partial_name) && !partial_name.is_empty() {
-            matches.push("..".to_string());
+        // 添加 . 和 .. 如果匹配（只在有输入时）
+        if !partial_name.is_empty() {
+            if ".".starts_with(&partial_name) {
+                matches.push(".".to_string());
+            }
+            if "..".starts_with(&partial_name) && base_path != "/" {
+                matches.push("..".to_string());
+            }
         }
         
         matches.sort();
         matches
+    }
+    
+    /// 解析补全路径，返回 (基础路径，待补全的名称)
+    fn parse_completion_path(current_path: &str, partial: &str) -> (String, String) {
+        if partial.is_empty() {
+            // 空输入：补全当前目录下的所有节点
+            return (current_path.to_string(), String::new());
+        }
+        
+        if partial == "/" {
+            // 根目录
+            return ("/".to_string(), String::new());
+        }
+        
+        // 构建完整路径
+        let full_path = if partial.starts_with('/') {
+            // 绝对路径
+            partial.to_string()
+        } else if current_path == "/" {
+            // 当前在根目录
+            format!("/{partial}")
+        } else {
+            // 相对路径
+            format!("{current_path}/{partial}")
+        };
+        
+        // 分离目录和文件名
+        if let Some(last_slash) = full_path.rfind('/') {
+            let base = if last_slash == 0 {
+                "/".to_string()
+            } else {
+                full_path[..last_slash].to_string()
+            };
+            let name = full_path[last_slash + 1..].to_string();
+            (base, name)
+        } else {
+            (current_path.to_string(), partial.to_string())
+        }
     }
 }
 
