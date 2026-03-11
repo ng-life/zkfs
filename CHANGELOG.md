@@ -2,6 +2,20 @@
 
 All notable changes to zkfs will be documented in this file.
 
+## [0.3.0] - 2026-03-11
+
+### ✨ Added
+- **代码已推送至 GitHub**
+  - 所有 v0.2.0 的改进现已在远程仓库
+  - 主分支：`main`
+  - 标签：`v0.2.0`, `v0.3.0`
+
+### 🔧 Technical
+- 版本号升级至 0.3.0
+- 确保代码和标签同步到远程
+
+---
+
 ## [0.2.0] - 2026-03-11
 
 ### ✨ Added
