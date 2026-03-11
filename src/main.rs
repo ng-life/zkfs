@@ -8,6 +8,7 @@ use rustyline::{Context as RlContext, Helper, Result as RlResult, Config, Editor
 use rustyline::error::ReadlineError;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
 
 /// Zookeeper 文件系统命令行工具
@@ -172,16 +173,20 @@ impl ZkFsCompleter {
             }
         };
         
-        // 使用 tokio 运行时执行异步操作
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(_) => return vec![],
-        };
-        
+        // 使用当前 tokio runtime 执行异步操作
         let client = self.client.clone();
-        let children = rt.block_on(async {
-            client.list_children(&base_path).await.unwrap_or_default()
-        });
+        let children = match Handle::try_current() {
+            Ok(handle) => {
+                // 在现有 runtime 上执行
+                handle.block_on(async {
+                    client.list_children(&base_path).await.unwrap_or_default()
+                })
+            }
+            Err(_) => {
+                // 没有 runtime，返回空列表
+                return vec![];
+            }
+        };
         
         // 过滤匹配的子节点（支持 . 和 ..）
         let mut matches: Vec<String> = children
